@@ -1,15 +1,13 @@
 {
-  "name": "twi2elevenlabs-proxy",
+  "name": "twi2elevenlabs",
   "version": "1.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=22"
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0"
-  },
-  "scripts": {
-    "start": "node server.js"
   }
 }
