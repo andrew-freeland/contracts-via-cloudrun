@@ -1,12 +1,18 @@
-cd ~/contracts-via-cloudrun
-cat > server.js <<'EOF'
 import http from 'http';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
 
+/**
+ * Twilio ↔ ElevenLabs bridge (hardened baseline)
+ * - WS server at /twilio accepts Twilio Media Streams
+ * - Connects to ElevenLabs ConvAI WS after Twilio "start"
+ * - μ-law 8kHz ⇄ PCM16 16kHz conversion
+ * - /healthz and /metrics endpoints
+ * - Validates Twilio accountSid and presence of a per-call token
+ */
+
 const PORT = process.env.PORT || 8080;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-const ELEVEN_ENDIAN = (process.env.ELEVEN_PCM_ENDIAN || 'le').toLowerCase() === 'be' ? 'be' : 'le';
 
 const app = express();
 let metrics = {
@@ -69,32 +75,33 @@ function twilioB64MuLawToPcm8k(b64) {
   for (let i = 0; i < buf.length; i++) out[i] = muLawDecode(buf[i]);
   return out;
 }
-function pcm8kToMuLawBuffer(pcm) {
+function pcm8kToTwilioB64MuLaw(pcm) {
   const out = Buffer.alloc(pcm.length);
   for (let i = 0; i < pcm.length; i++) out[i] = muLawEncode(pcm[i]);
-  return out; // raw μ-law bytes
+  return out.toString('base64');
 }
-function b64Pcm16ToInt16(b64, littleEndian=true) {
+function b64Pcm16ToInt16(b64) {
   const buf = Buffer.from(b64, 'base64');
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const arr = new Int16Array(buf.byteLength / 2);
-  for (let i = 0; i < arr.length; i++) arr[i] = view.getInt16(i * 2, littleEndian);
+  for (let i = 0; i < arr.length; i++) arr[i] = view.getInt16(i * 2, true);
   return arr;
 }
-function int16ToB64Pcm16(arr, littleEndian=true) {
+function int16ToB64Pcm16(arr) {
   const buf = Buffer.alloc(arr.length * 2);
-  if (littleEndian) {
-    for (let i = 0; i < arr.length; i++) buf.writeInt16LE(arr[i], i * 2);
-  } else {
-    for (let i = 0; i < arr.length; i++) buf.writeInt16BE(arr[i], i * 2);
-  }
+  for (let i = 0; i < arr.length; i++) buf.writeInt16LE(arr[i], i * 2);
   return buf.toString('base64');
 }
+
+/* ---------- Helpers ---------- */
 function getCustomParams(start) {
   const cp = start?.customParameters;
   if (!cp) return {};
-  if (Array.isArray(cp)) return cp.reduce((a, c) => { a[c.name] = c.value; return a; }, {});
-  return cp;
+  if (Array.isArray(cp)) {
+    // Twilio may send [{name, value}, ...]
+    return cp.reduce((a, c) => { a[c.name] = c.value; return a; }, {});
+  }
+  return cp; // object form { key: value }
 }
 
 /* ---------- Bridge wiring ---------- */
@@ -106,19 +113,14 @@ wss.on('connection', (twilioWS, request) => {
   let elevenWS = null;
 
   const send11 = (obj) => {
-    if (elevenWS && elevenWS.readyState === WebSocket.OPEN) elevenWS.send(JSON.stringify(obj));
-  };
-  const sendTwMediaFrames = (ulawBuf) => {
-    // Send Twilio-friendly 20ms frames (160 bytes @ 8kHz μ-law)
-    const FRAME = 160;
-    for (let i = 0; i < ulawBuf.length; i += FRAME) {
-      const slice = ulawBuf.subarray(i, Math.min(i + FRAME, ulawBuf.length));
-      const payload = slice.toString('base64');
-      twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-      metrics.bytesToTwilio += slice.length;
+    if (elevenWS && elevenWS.readyState === WebSocket.OPEN) {
+      elevenWS.send(JSON.stringify(obj));
     }
-    // pacing hint
-    twilioWS.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `ll-${Date.now()}` } }));
+  };
+  const sendTw = (obj) => {
+    if (twilioWS.readyState === WebSocket.OPEN) {
+      twilioWS.send(JSON.stringify(obj));
+    }
   };
 
   const connectEleven = (resolvedAgentId) => {
@@ -133,17 +135,21 @@ wss.on('connection', (twilioWS, request) => {
         const msg = JSON.parse(data.toString());
 
         if (msg.type === 'ping' && msg.ping_event?.event_id != null) {
-          elevenWS.send(JSON.stringify({ type: 'pong', event_id: msg.ping_event.event_id }));
+          send11({ type: 'pong', event_id: msg.ping_event.event_id });
           return;
         }
+
         if (msg.type === 'audio' && msg.audio_event?.audio_base_64) {
           metrics.chunksFrom11L++;
-          // EL PCM16 -> downsample -> μ-law -> 160B frames -> Twilio
-          const little = ELEVEN_ENDIAN === 'le';
-          const pcm16 = b64Pcm16ToInt16(msg.audio_event.audio_base_64, little);
+          const pcm16 = b64Pcm16ToInt16(msg.audio_event.audio_base_64);
           const pcm8  = downsample16kTo8k(pcm16);
-          const ulaw  = pcm8kToMuLawBuffer(pcm8);
-          if (streamSid) sendTwMediaFrames(ulaw);
+          const b64Mu = pcm8kToTwilioB64MuLaw(pcm8);
+          if (streamSid) {
+            const payload = { event: 'media', streamSid, media: { payload: b64Mu } };
+            metrics.bytesToTwilio += Buffer.from(b64Mu, 'base64').length;
+            sendTw(payload);
+            sendTw({ event: 'mark', streamSid, mark: { name: `ll-${Date.now()}` } });
+          }
         }
       } catch (e) {
         console.error('11L parse error', e);
@@ -162,6 +168,7 @@ wss.on('connection', (twilioWS, request) => {
         streamSid = msg.start?.streamSid || msg.streamSid;
         const twAcct = msg.start?.accountSid;
 
+        // Security: Twilio account must match
         if (process.env.TWILIO_ACCOUNT_SID && twAcct !== process.env.TWILIO_ACCOUNT_SID) {
           console.warn('Blocked start: accountSid mismatch', { got: twAcct });
           try { twilioWS.close(1008, 'bad account'); } catch {}
@@ -174,18 +181,17 @@ wss.on('connection', (twilioWS, request) => {
 
         if (!agentId) { try { twilioWS.close(1008, 'Missing agent_id'); } catch {}; return; }
         if (!token)   { try { twilioWS.close(1008, 'Missing token'); } catch {}; return; }
-
-        if (LOG_LEVEL === 'debug') console.log('TW start ok', { streamSid, agentId, ELEVEN_ENDIAN });
+        // TODO (harden): verify token signature / replay-protect with CallSid
 
         connectEleven(agentId);
+        if (LOG_LEVEL === 'debug') console.log('TW start ok', { streamSid, agentId });
 
       } else if (msg.event === 'media' && msg.media?.payload) {
         metrics.bytesFromTwilio += Buffer.from(msg.media.payload, 'base64').length;
         metrics.chunksFromTwilio++;
         const pcm8  = twilioB64MuLawToPcm8k(msg.media.payload);
         const pcm16 = upsample8kTo16k(pcm8);
-        const little = ELEVEN_ENDIAN === 'le';
-        send11({ user_audio_chunk: int16ToB64Pcm16(pcm16, little) });
+        send11({ user_audio_chunk: int16ToB64Pcm16(pcm16) });
 
       } else if (msg.event === 'stop') {
         try { if (elevenWS) elevenWS.close(1000, 'Twilio stop'); } catch {}
@@ -210,4 +216,3 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
 });
-EOF
